@@ -29,12 +29,13 @@ on:
 jobs:
   alert:
     runs-on: ubuntu-latest
+    timeout-minutes: 10     # hard ceiling — kills the job if yfinance hangs past this
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6        # updated: v4 -> v6 (Node.js 24)
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6   # updated: v5 -> v6 (Node.js 24)
         with:
           python-version: "3.12"
 
@@ -42,7 +43,7 @@ jobs:
       # across separate runs. The rolling key saves a fresh cache each run
       # and restores the most recent one via the restore-keys prefix.
       - name: Restore de-dup history
-        uses: actions/cache@v4
+        uses: actions/cache@v5          # updated: v4 -> v5 (Node.js 24)
         with:
           path: earnings_div_seen.json
           key: earnings-div-seen-${{ github.run_id }}
