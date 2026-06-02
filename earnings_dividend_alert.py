@@ -47,6 +47,7 @@ try:
 except ImportError:
     ZoneInfo = None  # Python < 3.9; time display degrades gracefully
 
+import concurrent.futures as _cf
 import requests
 
 
@@ -132,6 +133,11 @@ MIN_TRADING_DAYS = 1
 
 ENABLE_EARNINGS  = True
 ENABLE_DIVIDENDS = True
+
+# Parallel yfinance fetching — 138 tickers sequential = 9-14 min.
+# 10 workers brings that down to ~30 seconds typical.
+YFINANCE_WORKERS = 10   # parallel threads
+YFINANCE_TIMEOUT = 90   # hard ceiling (seconds) for the full calendar batch
 
 
 def _env(key, default=""):
@@ -232,12 +238,55 @@ HOUR_LABEL = {"bmo": "before open", "amc": "after close",
               "dmh": "during hours", "": ""}
 
 
+# ---- parallel yfinance calendar fetch ----------------------------
+
+def _yf_fetch_calendars(symbols):
+    """Fetch yfinance .calendar for every symbol in one parallel pass.
+
+    Returns {sym: calendar_dict}.  Tickers that time out or fail return {}.
+    A hard YFINANCE_TIMEOUT ceiling means no single slow or delisted ticker
+    can block the whole run.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        print("[yfinance not installed - dividend/earnings fallback skipped]")
+        return {s: {} for s in symbols}
+
+    def _one(sym):
+        return sym, yf.Ticker(yf_symbol(sym)).calendar or {}
+
+    result = {}
+    executor = _cf.ThreadPoolExecutor(max_workers=YFINANCE_WORKERS)
+    try:
+        fmap = {executor.submit(_one, sym): sym for sym in symbols}
+        try:
+            for fut in _cf.as_completed(fmap, timeout=YFINANCE_TIMEOUT):
+                sym = fmap[fut]
+                try:
+                    s, cal = fut.result()
+                    result[s] = cal
+                except Exception as ex:
+                    print(f"[yfinance: {sym} error: {ex}]")
+                    result[sym] = {}
+        except _cf.TimeoutError:
+            # Cut off any tickers still pending after the total timeout
+            for fut, sym in fmap.items():
+                if sym not in result:
+                    print(f"[yfinance: {sym} timed out — skipped]")
+                    result[sym] = {}
+    finally:
+        executor.shutdown(wait=False)   # don't block on any still-hanging threads
+    return result
+
+
 # ==================================================================
 # 3. EARNINGS
 # ==================================================================
 
-def fetch_earnings():
-    """Return {symbol: {'date': date, 'hour': str, 'eps': float|None}}."""
+def fetch_earnings(cals=None):
+    """Return {symbol: {'date': date, 'hour': str, 'eps': float|None}}.
+    Pass pre-fetched cals dict to avoid duplicate yfinance calls."""
     if FINNHUB_KEY:
         found = _earnings_finnhub()
         # Supplement: Finnhub's free tier is US-focused and won't return
@@ -245,9 +294,9 @@ def fetch_earnings():
         # Fall back to yfinance for those so no symbol is silently skipped.
         missed = [s for s in WATCHLIST if s not in found]
         if missed:
-            found.update(_earnings_yfinance(missed))
+            found.update(_earnings_yfinance(missed, cals))
         return found
-    return _earnings_yfinance(WATCHLIST)
+    return _earnings_yfinance(WATCHLIST, cals)
 
 
 def _earnings_finnhub():
@@ -285,26 +334,20 @@ def _earnings_finnhub():
     return out
 
 
-def _earnings_yfinance(symbols):
+def _earnings_yfinance(symbols, cals=None):
+    """Extract earnings dates from pre-fetched calendars (no extra network calls)."""
+    if cals is None:
+        cals = _yf_fetch_calendars(symbols)
     ref = now_et_date()
     out = {}
-    try:
-        import yfinance as yf
-    except ImportError:
-        print("[earnings: yfinance not installed - skipping earnings]")
-        return out
-
     for sym in symbols:
-        try:
-            cal = yf.Ticker(yf_symbol(sym)).calendar or {}
-            ed = cal.get("Earnings Date")
-            if isinstance(ed, (list, tuple)):
-                ed = ed[0] if ed else None
-            d = _as_date(ed)
-            if d and d >= ref:
-                out[sym] = {"date": d, "hour": "", "eps": None}
-        except Exception as ex:
-            print(f"[earnings: {sym} failed: {ex}]")
+        cal = cals.get(sym) or {}
+        ed = cal.get("Earnings Date")
+        if isinstance(ed, (list, tuple)):
+            ed = ed[0] if ed else None
+        d = _as_date(ed)
+        if d and d >= ref:
+            out[sym] = {"date": d, "hour": "", "eps": None}
     return out
 
 
@@ -312,45 +355,50 @@ def _earnings_yfinance(symbols):
 # 4. DIVIDENDS  (yfinance, no key)
 # ==================================================================
 
-def fetch_dividends():
-    """Return {symbol: {'exdate': date, 'amount': float|None, 'pay': date|None}}."""
+def fetch_dividends(cals=None):
+    """Return {symbol: {'exdate': date, 'amount': float|None, 'pay': date|None}}.
+    Pass pre-fetched cals dict to avoid duplicate yfinance calls."""
+    if cals is None:
+        cals = _yf_fetch_calendars(WATCHLIST)
     ref = now_et_date()
     out = {}
-    try:
-        import yfinance as yf
-    except ImportError:
-        print("[dividends: yfinance not installed - skipping dividends]")
-        return out
 
+    # Pass 1: extract ex-div dates from the already-fetched calendars (no network).
     for sym in WATCHLIST:
+        cal = cals.get(sym) or {}
+        exdate = _as_date(cal.get("Ex-Dividend Date"))
+        pay    = _as_date(cal.get("Dividend Date"))
+        if exdate and exdate >= ref:
+            out[sym] = {"exdate": exdate, "amount": None, "pay": pay}
+
+    # Pass 2: fetch .info only for the small subset with an upcoming ex-div
+    # (usually 0-5 tickers) to get the dividend amount.
+    if out:
         try:
-            tk = yf.Ticker(yf_symbol(sym))
-            exdate = pay = None
-            amount = None
+            import yfinance as yf
+        except ImportError:
+            return out
 
+        def _get_amount(sym):
             try:
-                cal = tk.calendar or {}
-                exdate = _as_date(cal.get("Ex-Dividend Date"))
-                pay    = _as_date(cal.get("Dividend Date"))
+                info = yf.Ticker(yf_symbol(sym)).info or {}
+                return sym, (info.get("lastDividendValue") or info.get("dividendRate"))
             except Exception:
-                pass
+                return sym, None
 
-            # Fallback / enrichment from .info (also gives the amount).
+        executor = _cf.ThreadPoolExecutor(max_workers=min(len(out), 5))
+        try:
+            fmap = {executor.submit(_get_amount, sym): sym for sym in out}
             try:
-                info = tk.info or {}
-                if not exdate:
-                    exdate = _ts_to_date(info.get("exDividendDate"))
-                if pay is None:
-                    pay = _ts_to_date(info.get("dividendDate"))
-                amount = (info.get("lastDividendValue")
-                          or info.get("dividendRate"))
-            except Exception:
+                for fut in _cf.as_completed(fmap, timeout=30):
+                    s, amount = fut.result()
+                    if s in out:
+                        out[s]["amount"] = amount
+            except _cf.TimeoutError:
                 pass
+        finally:
+            executor.shutdown(wait=False)
 
-            if exdate and exdate >= ref:
-                out[sym] = {"exdate": exdate, "amount": amount, "pay": pay}
-        except Exception as ex:
-            print(f"[dividends: {sym} failed: {ex}]")
     return out
 
 
@@ -446,10 +494,15 @@ def _td_phrase(n):
 
 def build_briefing():
     seen = load_seen()
+
+    # One parallel yfinance pass for all 138 tickers — shared between
+    # earnings fallback and dividends so the network is hit only once.
+    cals = _yf_fetch_calendars(WATCHLIST) if (ENABLE_EARNINGS or ENABLE_DIVIDENDS) else {}
+
     earn_lines, div_lines = [], []
 
     if ENABLE_EARNINGS:
-        for sym, info in sorted(fetch_earnings().items()):
+        for sym, info in sorted(fetch_earnings(cals).items()):
             n = trading_days_until(info["date"])
             if not _window_ok(n):
                 continue
@@ -467,7 +520,7 @@ def build_briefing():
             earn_lines.append("- " + "  ".join(bits))
 
     if ENABLE_DIVIDENDS:
-        for sym, info in sorted(fetch_dividends().items()):
+        for sym, info in sorted(fetch_dividends(cals).items()):
             n = trading_days_until(info["exdate"])
             if not _window_ok(n):
                 continue
