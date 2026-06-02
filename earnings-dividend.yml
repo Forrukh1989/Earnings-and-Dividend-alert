@@ -1,0 +1,60 @@
+# .github/workflows/earnings-dividend.yml
+# ------------------------------------------------------------------
+# Free always-on scheduling for earnings_dividend_alert.py.
+# Public repos: unlimited minutes. Private repos: 2,000 free min/month
+# (this job uses a tiny fraction of that).
+#
+# SETUP (one time):
+#   1. Put earnings_dividend_alert.py in the repo root.
+#   2. Put this file at  .github/workflows/earnings-dividend.yml
+#   3. Repo -> Settings -> Secrets and variables -> Actions -> add:
+#        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, FINNHUB_KEY (optional)
+#   4. Commit. It starts running on the schedule below.
+#
+# WHY ONCE A DAY: earnings and dividend dates do not change intraday, so a
+# single daily check on every US trading day is enough to catch each event
+# exactly 3 trading days ahead. No need to run it every 30 minutes.
+#
+# Times are UTC. 02:00 UTC = 08:00 in Dhaka (UTC+6), and that is roughly
+# 10 PM the previous evening US Eastern (after the close), so the calendar
+# data is fresh and the alert lands in your morning. Mon-Fri = US sessions.
+
+name: earnings-dividend
+
+on:
+  schedule:
+    - cron: "0 2 * * 1-5"     # 08:00 Dhaka, Monday through Friday
+  workflow_dispatch:           # lets you run it manually from the Actions tab
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Restore the de-dup history so each event alerts only once, even
+      # across separate runs. The rolling key saves a fresh cache each run
+      # and restores the most recent one via the restore-keys prefix.
+      - name: Restore de-dup history
+        uses: actions/cache@v4
+        with:
+          path: earnings_div_seen.json
+          key: earnings-div-seen-${{ github.run_id }}
+          restore-keys: |
+            earnings-div-seen-
+
+      - name: Install dependencies
+        run: pip install requests yfinance
+
+      - name: Run alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          FINNHUB_KEY:        ${{ secrets.FINNHUB_KEY }}
+        run: python earnings_dividend_alert.py
