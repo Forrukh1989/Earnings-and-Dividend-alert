@@ -1,36 +1,60 @@
-# This is a basic workflow to help you get started with Actions
+# .github/workflows/earnings-dividend.yml
+# ------------------------------------------------------------------
+# Free always-on scheduling for earnings_dividend_alert.py.
+# Public repos: unlimited minutes. Private repos: 2,000 free min/month
+# (this job uses a tiny fraction of that).
+#
+# SETUP (one time):
+#   1. Put earnings_dividend_alert.py in the repo root.
+#   2. Put this file at  .github/workflows/earnings-dividend.yml
+#   3. Repo -> Settings -> Secrets and variables -> Actions -> add:
+#        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, FINNHUB_KEY (optional)
+#   4. Commit. It starts running on the schedule below.
+#
+# WHY ONCE A DAY: earnings and dividend dates do not change intraday, so a
+# single daily check on every US trading day is enough to catch each event
+# exactly 3 trading days ahead. No need to run it every 30 minutes.
+#
+# Times are UTC. 02:00 UTC = 08:00 in Dhaka (UTC+6), and that is roughly
+# 10 PM the previous evening US Eastern (after the close), so the calendar
+# data is fresh and the alert lands in your morning. Mon-Fri = US sessions.
 
-name: CI
+name: earnings-dividend
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  schedule:
+    - cron: "0 2 * * 1-5"     # 08:00 Dhaka, Monday through Friday
+  workflow_dispatch:           # lets you run it manually from the Actions tab
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  alert:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+      # Restore the de-dup history so each event alerts only once, even
+      # across separate runs. The rolling key saves a fresh cache each run
+      # and restores the most recent one via the restore-keys prefix.
+      - name: Restore de-dup history
+        uses: actions/cache@v4
+        with:
+          path: earnings_div_seen.json
+          key: earnings-div-seen-${{ github.run_id }}
+          restore-keys: |
+            earnings-div-seen-
+
+      - name: Install dependencies
+        run: pip install requests yfinance
+
+      - name: Run alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          FINNHUB_KEY:        ${{ secrets.FINNHUB_KEY }}
+        run: python earnings_dividend_alert.py
