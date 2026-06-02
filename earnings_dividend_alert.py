@@ -124,7 +124,7 @@ WATCHLIST = [
 ]
 
 # Lead time. Alert when an event is exactly this many trading days out.
-ALERT_TRADING_DAYS = 3
+ALERT_TRADING_DAYS = 30
 
 # Catch-up safety net. If a scheduled run is skipped, still alert when the
 # event is anywhere from 1 up to ALERT_TRADING_DAYS sessions away. De-dup
