@@ -123,13 +123,13 @@ WATCHLIST = [
     "RMS.PA",  # Hermès — Paris (Euronext); user listed as HRMS.PA
 ]
 
-# Lead time. Alert when an event is exactly this many trading days out.
-ALERT_TRADING_DAYS = 30
+# Lead time. Start alerting this many trading days before each event.
+# The script sends a fresh alert every day: 3 days out → 2 → 1 → TODAY.
+ALERT_TRADING_DAYS = 3
 
-# Catch-up safety net. If a scheduled run is skipped, still alert when the
-# event is anywhere from 1 up to ALERT_TRADING_DAYS sessions away. De-dup
-# guarantees you still only get one alert per event.
-MIN_TRADING_DAYS = 1
+# 0 = include the event day itself in the countdown.
+# Each step (3, 2, 1, 0) fires exactly once per event thanks to de-dup.
+MIN_TRADING_DAYS = 0
 
 ENABLE_EARNINGS  = True
 ENABLE_DIVIDENDS = True
@@ -442,9 +442,10 @@ def load_seen():
 
 
 def save_seen(seen):
-    # prune keys whose event date is in the past so the file stays small
+    # Key format: TYPE|SYM|DATE|N  (e.g. EARN|AAPL|2026-06-10|3)
+    # Position 2 is always the event date — safe for both old and new format.
     ref = now_et_date().isoformat()
-    pruned = {k: v for k, v in seen.items() if k.split("|")[-1] >= ref}
+    pruned = {k: v for k, v in seen.items() if k.split("|")[2] >= ref}
     try:
         SEEN_FILE.write_text(json.dumps(pruned, indent=0))
     except Exception as ex:
@@ -494,61 +495,71 @@ def _td_phrase(n):
 
 def build_briefing():
     seen = load_seen()
-
-    # One parallel yfinance pass for all 138 tickers — shared between
-    # earnings fallback and dividends so the network is hit only once.
     cals = _yf_fetch_calendars(WATCHLIST) if (ENABLE_EARNINGS or ENABLE_DIVIDENDS) else {}
 
-    earn_lines, div_lines = [], []
+    # Separate group dicts keep earnings and dividends in their own sections.
+    # Each dict maps days-remaining -> list of bullet lines.
+    earn_groups: dict[int, list[str]] = {}
+    div_groups:  dict[int, list[str]] = {}
 
     if ENABLE_EARNINGS:
         for sym, info in sorted(fetch_earnings(cals).items()):
             n = trading_days_until(info["date"])
             if not _window_ok(n):
                 continue
-            key = f"EARN|{sym}|{info['date'].isoformat()}"
+            key = f"EARN|{sym}|{info['date'].isoformat()}|{n}"
             if key in seen:
                 continue
             seen[key] = now_et_date().isoformat()
-            hour = HOUR_LABEL.get(info["hour"], "")
-            bits = [f"{sym}", fmt_event_date(info["date"])]
+            parts = [sym, "TODAY" if n == 0 else fmt_event_date(info["date"])]
+            hour = HOUR_LABEL.get(info.get("hour", ""), "")
             if hour:
-                bits.append(f"({hour})")
-            bits.append(_td_phrase(n))
+                parts.append(hour)
             if info.get("eps") is not None:
-                bits.append(f"EPS est {info['eps']}")
-            earn_lines.append("- " + "  ".join(bits))
+                parts.append(f"EPS est {info['eps']}")
+            earn_groups.setdefault(n, []).append(" — ".join(parts))
 
     if ENABLE_DIVIDENDS:
         for sym, info in sorted(fetch_dividends(cals).items()):
             n = trading_days_until(info["exdate"])
             if not _window_ok(n):
                 continue
-            key = f"DIV|{sym}|{info['exdate'].isoformat()}"
+            key = f"DIV|{sym}|{info['exdate'].isoformat()}|{n}"
             if key in seen:
                 continue
             seen[key] = now_et_date().isoformat()
-            bits = [f"{sym}", "ex-div " + fmt_event_date(info["exdate"]),
-                    _td_phrase(n)]
+            parts = [sym, "TODAY" if n == 0 else fmt_event_date(info["exdate"])]
             if info.get("amount"):
-                bits.append(f"${info['amount']:.2f}/sh")
+                parts.append(f"${info['amount']:.2f}/sh")
             if info.get("pay"):
-                bits.append(f"pay {fmt_event_date(info['pay'])}")
-            div_lines.append("- " + "  ".join(bits))
+                parts.append(f"pay {fmt_event_date(info['pay'])}")
+            div_groups.setdefault(n, []).append(" — ".join(parts))
 
     save_seen(seen)
 
-    sections = []
-    if earn_lines:
-        sections.append("EARNINGS\n" + "\n".join(earn_lines))
-    if div_lines:
-        sections.append("EX-DIVIDEND\n" + "\n".join(div_lines))
-    if not sections:
+    if not earn_groups and not div_groups:
         return None
 
-    header = (f"EARNINGS & DIVIDENDS  -  {ALERT_TRADING_DAYS} trading days out"
-              f"\n{fmt_now()}")
-    return header + "\n\n" + "\n\n".join(sections)
+    def _day_header(n):
+        if n == 0:   return "TODAY"
+        if n == 1:   return "IN 1 TRADING DAY"
+        return f"IN {n} TRADING DAYS"
+
+    def _render_section(title, groups):
+        if not groups:
+            return ""
+        parts = [title]
+        for n in sorted(groups.keys()):
+            lines = "\n".join(f"  • {line}" for line in groups[n])
+            parts.append(f"{_day_header(n)}\n{lines}")
+        return "\n\n".join(parts)
+
+    header   = f"📅 EARNINGS & DIVIDENDS\n{fmt_now()}"
+    earn_sec = _render_section("📊 EARNINGS", earn_groups)
+    div_sec  = _render_section("💰 DIVIDENDS", div_groups)
+
+    body = "\n\n".join(s for s in [earn_sec, div_sec] if s)
+    return header + "\n\n" + body
 
 
 def main():
@@ -556,8 +567,8 @@ def main():
     if briefing:
         send_telegram(briefing)
     else:
-        print(f"[{fmt_now()}] Nothing inside the {ALERT_TRADING_DAYS}-trading-day "
-              f"window this pass.")
+        print(f"[{fmt_now()}] No earnings or ex-dividends within "
+              f"the next {ALERT_TRADING_DAYS} trading days.")
 
 
 # ==================================================================
@@ -599,10 +610,10 @@ def selftest():
     assert got == 3, "holiday straddle math wrong"
     print("Trading-day math: OK")
 
-    # De-dup window logic
-    assert _window_ok(3) and _window_ok(1) and not _window_ok(0) \
+    # De-dup window logic: 0 (today), 1, 2, 3 should all pass; 4+ should not
+    assert _window_ok(0) and _window_ok(1) and _window_ok(3) \
         and not _window_ok(4), "window logic wrong"
-    print("Lead-window logic: OK")
+    print("Lead-window logic: OK  (0=today, 1, 2, 3 pass; 4 blocked)")
 
     print("-" * 40)
     print("All checks passed. Logic is sound; live run needs network + yfinance.")
